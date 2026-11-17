@@ -668,25 +668,50 @@ function canCurrentUserManageEmployees() {
 // ============================================================================
 document.addEventListener('DOMContentLoaded', async () => {
   loadStateFromStorage();
+  let restoredAuthSession = null;
   if (typeof initSupabaseClient === 'function') {
     initSupabaseClient();
     if (isSupabaseEnabled()) {
-      await syncFromSupabase();
+      if (typeof fetchLoginDirectoryFromSupabase === 'function') {
+        const dir = await fetchLoginDirectoryFromSupabase();
+        if (Array.isArray(dir) && dir.length > 0) {
+          employees = dir;
+        }
+      }
+      if (typeof getSupabaseAuthSession === 'function') {
+        restoredAuthSession = await getSupabaseAuthSession();
+      }
+      if (restoredAuthSession) {
+        await syncFromSupabase();
+      }
     }
   }
   initLiveClock();
   initDefaultDateFilters();
   populateLoginEmployeeSelect();
 
-  const savedSessionUserId = sessionStorage.getItem(SESSION_USER_KEY);
-  if (savedSessionUserId && employees.some(e => e.id === savedSessionUserId)) {
-    currentUserId = savedSessionUserId;
+  let matchedUser = null;
+  if (restoredAuthSession && restoredAuthSession.user) {
+    const uid = restoredAuthSession.user.id;
+    const emailNip = String(restoredAuthSession.user.email || '').split('@')[0];
+    matchedUser = employees.find(e => (e.authUserId && e.authUserId === uid) || (emailNip && e.nip === emailNip));
+  } else if (!isSupabaseEnabled()) {
+    const savedSessionUserId = sessionStorage.getItem(SESSION_USER_KEY);
+    if (savedSessionUserId) {
+      matchedUser = employees.find(e => e.id === savedSessionUserId);
+    }
+  }
+
+  if (matchedUser) {
+    currentUserId = matchedUser.id;
+    sessionStorage.setItem(SESSION_USER_KEY, currentUserId);
     hideLoginScreen();
     populateUserRoleSwitcher();
     populateAllEmployeeDropdowns();
     refreshAllViews();
   } else {
     currentUserId = null;
+    sessionStorage.removeItem(SESSION_USER_KEY);
     showLoginScreen();
   }
 });
@@ -759,7 +784,7 @@ function syncLoginSelectFromNip() {
   select.value = emp ? emp.id : '';
 }
 
-function submitInitialLogin(event) {
+async function submitInitialLogin(event) {
   event.preventDefault();
   const nipVal = (document.getElementById('loginNipInput')?.value || '').trim();
   const selectId = document.getElementById('loginEmployeeSelect')?.value || '';
@@ -767,14 +792,31 @@ function submitInitialLogin(event) {
   const errEl = document.getElementById('loginError');
 
   const targetEmp = employees.find(e => (nipVal && e.nip === nipVal) || (selectId && e.id === selectId));
-  if (!targetEmp || !isPinValidForEmployee(targetEmp, pinVal)) {
+  if (!targetEmp) {
     if (errEl) errEl.classList.remove('hidden');
     return;
   }
 
-  if (errEl) errEl.classList.add('hidden');
-  currentUserId = targetEmp.id;
-  sessionStorage.setItem(SESSION_USER_KEY, currentUserId);
+  if (typeof isSupabaseEnabled === 'function' && isSupabaseEnabled() && typeof signInWithSupabaseAuth === 'function') {
+    const authRes = await signInWithSupabaseAuth(targetEmp.nip, pinVal);
+    if (!authRes.success) {
+      if (errEl) errEl.classList.remove('hidden');
+      return;
+    }
+    if (errEl) errEl.classList.add('hidden');
+    currentUserId = targetEmp.id;
+    sessionStorage.setItem(SESSION_USER_KEY, currentUserId);
+    await syncFromSupabase();
+  } else {
+    if (!isPinValidForEmployee(targetEmp, pinVal)) {
+      if (errEl) errEl.classList.remove('hidden');
+      return;
+    }
+    if (errEl) errEl.classList.add('hidden');
+    currentUserId = targetEmp.id;
+    sessionStorage.setItem(SESSION_USER_KEY, currentUserId);
+  }
+
   hideLoginScreen();
   populateUserRoleSwitcher();
   populateAllEmployeeDropdowns();
@@ -786,9 +828,12 @@ function submitInitialLogin(event) {
   showToast(`Selamat datang, ${targetEmp.name} (${targetEmp.role})`);
 }
 
-function logoutUser() {
+async function logoutUser() {
   currentUserId = null;
   sessionStorage.removeItem(SESSION_USER_KEY);
+  if (typeof signOutSupabaseAuth === 'function') {
+    await signOutSupabaseAuth();
+  }
   showLoginScreen();
   showToast('Anda telah keluar dari sesi aplikasi.');
 }
@@ -1084,22 +1129,34 @@ function cancelPinAuthModal() {
   if (select) select.value = currentUserId;
 }
 
-function submitPinAuth(event) {
+async function submitPinAuth(event) {
   event.preventDefault();
   if (!pendingSwitchUserId) return;
 
   const targetEmp = getEmployeeById(pendingSwitchUserId);
   const inputPin = document.getElementById('pinAuthInput').value;
 
-  if (!isPinValidForEmployee(targetEmp, inputPin)) {
-    document.getElementById('pinAuthError').classList.remove('hidden');
-    return;
+  if (typeof isSupabaseEnabled === 'function' && isSupabaseEnabled() && typeof signInWithSupabaseAuth === 'function') {
+    const authRes = await signInWithSupabaseAuth(targetEmp.nip, inputPin);
+    if (!authRes.success) {
+      document.getElementById('pinAuthError').classList.remove('hidden');
+      return;
+    }
+    currentUserId = pendingSwitchUserId;
+    pendingSwitchUserId = null;
+    sessionStorage.setItem(SESSION_USER_KEY, currentUserId);
+    document.getElementById('pinAuthModal').classList.add('hidden');
+    await syncFromSupabase();
+  } else {
+    if (!isPinValidForEmployee(targetEmp, inputPin)) {
+      document.getElementById('pinAuthError').classList.remove('hidden');
+      return;
+    }
+    currentUserId = pendingSwitchUserId;
+    pendingSwitchUserId = null;
+    sessionStorage.setItem(SESSION_USER_KEY, currentUserId);
+    document.getElementById('pinAuthModal').classList.add('hidden');
   }
-
-  currentUserId = pendingSwitchUserId;
-  pendingSwitchUserId = null;
-  sessionStorage.setItem(SESSION_USER_KEY, currentUserId);
-  document.getElementById('pinAuthModal').classList.add('hidden');
 
   updateActiveUserHeaderUI();
   populateAllEmployeeDropdowns();
@@ -1114,28 +1171,34 @@ function submitPinAuth(event) {
   showToast(`Otorisasi PIN berhasil! Masuk sebagai: ${targetEmp.name} (${targetEmp.role})`);
 }
 
-function openChangeMyPinModal() {
+async function openChangeMyPinModal() {
   const user = getCurrentUser();
   if (!user) return;
   const newPin = prompt(
-    `Ubah PIN Keamanan untuk ${user.name}\n(Masukkan 4 s.d. 6 digit angka):`,
-    getDefaultPinForEmployee(user)
+    `Ubah PIN Keamanan untuk ${user.name}\n(Masukkan tepat 6 digit angka):`,
+    ''
   );
   if (newPin === null) return;
   const clean = newPin.trim();
-  if (!/^\d{4,6}$/.test(clean)) {
-    alert('PIN harus berupa 4 hingga 6 digit angka!');
+  if (!/^\d{6}$/.test(clean)) {
+    alert('PIN harus berupa tepat 6 digit angka (sesuai standar keamanan Supabase Auth)!');
     return;
   }
-  const idx = employees.findIndex(e => e.id === user.id);
-  if (idx !== -1) {
-    employees[idx].pin = clean;
-    saveStateToStorage();
-    if (typeof upsertEmployeeToSupabase === 'function') {
-      upsertEmployeeToSupabase(employees[idx]);
+
+  if (typeof isSupabaseEnabled === 'function' && isSupabaseEnabled() && typeof updateSupabaseAuthPassword === 'function') {
+    const res = await updateSupabaseAuthPassword(clean);
+    if (!res.success) {
+      alert(`Gagal memperbarui PIN di Supabase Auth: ${res.error}`);
+      return;
     }
-    showToast('PIN keamanan Anda berhasil diperbarui!');
+  } else {
+    const idx = employees.findIndex(e => e.id === user.id);
+    if (idx !== -1) {
+      employees[idx].pin = clean;
+      saveStateToStorage();
+    }
   }
+  showToast('PIN keamanan Anda berhasil diperbarui!');
 }
 
 function updateActiveUserHeaderUI() {
@@ -1547,7 +1610,27 @@ function loadSelectedAttendanceCard() {
   document.getElementById('formFeedbackStatus').textContent = '';
 
   renderAttendancePhotoThumbnails(rec);
+  syncAttendanceTimeInputLocks(rec);
   previewDurationCalculation();
+}
+
+function syncAttendanceTimeInputLocks(rec) {
+  const inInput = document.getElementById('formCheckInTime');
+  const outInput = document.getElementById('formCheckOutTime');
+  const lockClasses = ['bg-slate-100', 'cursor-not-allowed', 'text-slate-600'];
+
+  if (inInput) {
+    const hasInPhoto = Boolean(rec && rec.photoCheckIn);
+    inInput.readOnly = hasInPhoto;
+    inInput.title = hasInPhoto ? 'Jam masuk dikunci otomatis sesuai waktu rekam foto' : '';
+    lockClasses.forEach(cls => inInput.classList.toggle(cls, hasInPhoto));
+  }
+  if (outInput) {
+    const hasOutPhoto = Boolean(rec && rec.photoCheckOut);
+    outInput.readOnly = hasOutPhoto;
+    outInput.title = hasOutPhoto ? 'Jam pulang dikunci otomatis sesuai waktu rekam foto' : '';
+    lockClasses.forEach(cls => outInput.classList.toggle(cls, hasOutPhoto));
+  }
 }
 
 function renderAttendancePhotoThumbnails(rec) {
@@ -1555,9 +1638,12 @@ function renderAttendancePhotoThumbnails(rec) {
   const outBox = document.getElementById('attPhotoOutBox');
   if (!inBox || !outBox) return;
 
-  if (rec.photoCheckIn) {
+  const inDisplayUrl = typeof getPhotoDisplayUrl === 'function' ? getPhotoDisplayUrl(rec.photoCheckIn) : rec.photoCheckIn;
+  const outDisplayUrl = typeof getPhotoDisplayUrl === 'function' ? getPhotoDisplayUrl(rec.photoCheckOut) : rec.photoCheckOut;
+
+  if (rec.photoCheckIn && inDisplayUrl) {
     inBox.innerHTML = `
-      <img src="${rec.photoCheckIn}" onclick="openPhotoViewer('${rec.id}', 'IN')" class="w-full h-full object-cover cursor-pointer hover:opacity-90 transition" title="Klik untuk memperbesar Foto Absen Masuk" />
+      <img src="${inDisplayUrl}" onclick="openPhotoViewer('${rec.id}', 'IN')" class="w-full h-full object-cover cursor-pointer hover:opacity-90 transition" title="Klik untuk memperbesar Foto Absen Masuk" />
       <span class="absolute bottom-1 right-1 bg-emerald-600 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow">
         <i class="fa-solid fa-location-dot mr-0.5"></i> Geotag OK
       </span>
@@ -1569,9 +1655,9 @@ function renderAttendancePhotoThumbnails(rec) {
     `;
   }
 
-  if (rec.photoCheckOut) {
+  if (rec.photoCheckOut && outDisplayUrl) {
     outBox.innerHTML = `
-      <img src="${rec.photoCheckOut}" onclick="openPhotoViewer('${rec.id}', 'OUT')" class="w-full h-full object-cover cursor-pointer hover:opacity-90 transition" title="Klik untuk memperbesar Foto Absen Pulang" />
+      <img src="${outDisplayUrl}" onclick="openPhotoViewer('${rec.id}', 'OUT')" class="w-full h-full object-cover cursor-pointer hover:opacity-90 transition" title="Klik untuk memperbesar Foto Absen Pulang" />
       <span class="absolute bottom-1 right-1 bg-amber-600 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow">
         <i class="fa-solid fa-location-dot mr-0.5"></i> Geotag OK
       </span>
@@ -1627,6 +1713,7 @@ let currentGpsInfo = {
   isRealGps: false
 };
 let capturedWatermarkedDataUrl = null;
+let lastCaptureSource = 'CAMERA'; // 'CAMERA' atau 'FILE_UPLOAD'
 
 function openCameraAttendanceModal(mode) {
   const select = document.getElementById('attendanceAssignmentSelect');
@@ -1767,6 +1854,7 @@ function captureGeotaggedPhoto() {
     alert('Kamera langsung belum aktif. Silakan klik tombol "File Kamera" untuk memilih/memotret foto.');
     return;
   }
+  lastCaptureSource = 'CAMERA';
   renderWatermarkedCanvasFromSource(video, video.videoWidth || 640, video.videoHeight || 480);
   stopLiveWebcamStream();
 }
@@ -1775,6 +1863,19 @@ function handleFallbackPhotoUpload(event) {
   const file = event.target.files?.[0];
   if (!file) return;
 
+  if (!file.type || !file.type.startsWith('image/')) {
+    alert('File harus berupa gambar (JPG/PNG/WEBP).');
+    event.target.value = '';
+    return;
+  }
+  const MAX_PHOTO_BYTES = 15 * 1024 * 1024;
+  if (file.size > MAX_PHOTO_BYTES) {
+    alert('Ukuran file foto terlalu besar (maksimal 15 MB).');
+    event.target.value = '';
+    return;
+  }
+
+  lastCaptureSource = 'FILE_UPLOAD';
   const reader = new FileReader();
   reader.onload = (e) => {
     const img = new Image();
@@ -1790,14 +1891,15 @@ function handleFallbackPhotoUpload(event) {
 }
 
 /**
- * Menggambar foto ke Canvas (kompresi 640x480) dan menempelkan Watermark Geotagging & Timestamp Kemenkes
+ * Menggambar foto ke Canvas (adaptif landscape 640x480 / portrait 480x640) dan menempelkan Watermark Geotagging & Timestamp Kemenkes
  */
 function renderWatermarkedCanvasFromSource(sourceEl, srcWidth, srcHeight) {
   const canvas = document.getElementById('cameraPhotoCanvas');
   if (!canvas) return;
 
-  const targetW = 640;
-  const targetH = 480;
+  const isPortrait = srcHeight > srcWidth;
+  const targetW = isPortrait ? 480 : 640;
+  const targetH = isPortrait ? 640 : 480;
   canvas.width = targetW;
   canvas.height = targetH;
   const ctx = canvas.getContext('2d');
@@ -1823,6 +1925,10 @@ function renderWatermarkedCanvasFromSource(sourceEl, srcWidth, srcHeight) {
   const timeStamp = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   const dateStamp = now.toLocaleDateString('id-ID', { weekday: 'long', day: '2-digit', month: 'short', year: 'numeric' });
   const modeLabel = cameraMode === 'IN' ? 'ABSEN MASUK FWA' : 'ABSEN PULANG FWA';
+  const sourceTag = lastCaptureSource === 'FILE_UPLOAD' ? 'UNGGAH FILE' : 'KAMERA';
+  const gpsLabel = currentGpsInfo.isRealGps
+    ? currentGpsInfo.coordsText
+    : `${currentGpsInfo.coordsText} [GPS FALLBACK]`;
 
   // Gambar blok semi-transparan di bagian bawah foto untuk Watermark Geotagging
   const boxH = 128;
@@ -1839,28 +1945,29 @@ function renderWatermarkedCanvasFromSource(sourceEl, srcWidth, srcHeight) {
   ctx.fillRect(14, boxY + 6, 5, boxH - 18);
 
   // Badge Header Watermark
-  ctx.font = 'bold 13px sans-serif';
+  ctx.font = isPortrait ? 'bold 11px sans-serif' : 'bold 13px sans-serif';
   ctx.fillStyle = cameraMode === 'IN' ? '#bef264' : '#fde68a';
-  ctx.fillText(`e-FWA BKK MERAUKE • ${modeLabel} (${rec ? rec.fwaType : 'FWA'})`, 28, boxY + 22);
+  ctx.fillText(`e-FWA BKK MERAUKE • ${modeLabel} • ${sourceTag}`, 28, boxY + 22);
 
   // Nama & NIP Pegawai
-  ctx.font = 'bold 15px sans-serif';
+  ctx.font = isPortrait ? 'bold 13px sans-serif' : 'bold 15px sans-serif';
   ctx.fillStyle = '#ffffff';
   ctx.fillText(`${emp ? emp.name : '-'}  |  NIP. ${emp ? emp.nip : '-'}`, 28, boxY + 44);
 
   // Tanggal & Waktu Presisi
-  ctx.font = 'bold 13px monospace';
+  ctx.font = isPortrait ? 'bold 11px monospace' : 'bold 13px monospace';
   ctx.fillStyle = '#99f6e4';
-  ctx.fillText(`WAKTU  : ${dateStamp} • Pukul ${timeStamp} WIT`, 28, boxY + 66);
+  ctx.fillText(`WAKTU  : ${dateStamp} • ${timeStamp} WIT`, 28, boxY + 66);
 
   // Koordinat GPS
-  ctx.font = '12px monospace';
-  ctx.fillStyle = '#e2e8f0';
-  ctx.fillText(`KOORD  : ${currentGpsInfo.coordsText}`, 28, boxY + 86);
+  ctx.font = isPortrait ? '10px monospace' : '12px monospace';
+  ctx.fillStyle = currentGpsInfo.isRealGps ? '#e2e8f0' : '#fcd34d';
+  ctx.fillText(`KOORD  : ${gpsLabel}`, 28, boxY + 86);
 
   // Nama Lokasi / Tempat FWA
-  const cleanLoc = locDetail.length > 68 ? locDetail.slice(0, 68) + '...' : locDetail;
-  ctx.font = '12px sans-serif';
+  const maxLocLen = isPortrait ? 46 : 68;
+  const cleanLoc = locDetail.length > maxLocLen ? locDetail.slice(0, maxLocLen) + '...' : locDetail;
+  ctx.font = isPortrait ? '11px sans-serif' : '12px sans-serif';
   ctx.fillStyle = '#cbd5e1';
   ctx.fillText(`LOKASI : ${cleanLoc}`, 28, boxY + 106);
 
@@ -1887,27 +1994,33 @@ async function confirmAndSavePhotoAttendance() {
   const timeVal = `${hh}:${mm}`;
 
   let storedPhotoUrl = capturedWatermarkedDataUrl;
+  let cloudUploadFailed = false;
   if (typeof uploadPhotoToSupabase === 'function' && isSupabaseEnabled()) {
     showToast('Mengunggah foto geotag ke Supabase Storage...');
     storedPhotoUrl = await uploadPhotoToSupabase(fwaRecords[recIndex].id, cameraMode, capturedWatermarkedDataUrl);
+    cloudUploadFailed = storedPhotoUrl.startsWith('data:image');
   }
+
+  const recordedGpsText = currentGpsInfo.isRealGps
+    ? currentGpsInfo.coordsText
+    : `${currentGpsInfo.coordsText} [GPS Fallback]`;
 
   if (cameraMode === 'IN') {
     document.getElementById('formCheckInTime').value = timeVal;
     fwaRecords[recIndex].checkIn = timeVal;
     fwaRecords[recIndex].photoCheckIn = storedPhotoUrl;
-    fwaRecords[recIndex].gpsCheckIn = currentGpsInfo.coordsText;
+    fwaRecords[recIndex].gpsCheckIn = recordedGpsText;
   } else {
     document.getElementById('formCheckOutTime').value = timeVal;
     fwaRecords[recIndex].checkOut = timeVal;
     fwaRecords[recIndex].photoCheckOut = storedPhotoUrl;
-    fwaRecords[recIndex].gpsCheckOut = currentGpsInfo.coordsText;
+    fwaRecords[recIndex].gpsCheckOut = recordedGpsText;
   }
 
   // Sematkan koordinat GPS ke kolom detail tempat FWA jika belum ada
   const locInput = document.getElementById('formLocationDetail');
   if (locInput && !locInput.value.includes('Lat:')) {
-    locInput.value = `${locInput.value} [${currentGpsInfo.coordsText}]`.trim();
+    locInput.value = `${locInput.value} [${recordedGpsText}]`.trim();
     fwaRecords[recIndex].locationDetail = locInput.value;
   }
 
@@ -1916,18 +2029,24 @@ async function confirmAndSavePhotoAttendance() {
     upsertFwaRecordToSupabase(fwaRecords[recIndex]);
   }
   renderAttendancePhotoThumbnails(fwaRecords[recIndex]);
+  syncAttendanceTimeInputLocks(fwaRecords[recIndex]);
   previewDurationCalculation();
   refreshAllViews();
   closeCameraAttendanceModal();
 
-  showToast(`Foto Geotag & ${cameraMode === 'IN' ? 'Absen Masuk' : 'Absen Pulang'} (${timeVal}) berhasil direkam!`);
+  if (cloudUploadFailed) {
+    showToast('Upload ke Cloud Storage gagal. Foto hanya tersimpan di browser lokal.');
+  } else {
+    showToast(`Foto Geotag & ${cameraMode === 'IN' ? 'Absen Masuk' : 'Absen Pulang'} (${timeVal}) berhasil direkam!`);
+  }
 }
 
 function openPhotoViewer(recordId, mode) {
   const rec = fwaRecords.find(r => r.id === recordId);
   if (!rec) return;
   const emp = getEmployeeById(rec.employeeId);
-  const photoData = mode === 'IN' ? rec.photoCheckIn : rec.photoCheckOut;
+  const rawPhoto = mode === 'IN' ? rec.photoCheckIn : rec.photoCheckOut;
+  const photoData = typeof getPhotoDisplayUrl === 'function' ? (getPhotoDisplayUrl(rawPhoto) || rawPhoto) : rawPhoto;
   if (!photoData) {
     alert('Belum ada bukti foto pada absensi ini.');
     return;
@@ -2702,7 +2821,7 @@ function closeEmployeeModal() {
   document.getElementById('employeeModal').classList.add('hidden');
 }
 
-function handleSaveEmployee(event) {
+async function handleSaveEmployee(event) {
   event.preventDefault();
   if (!canCurrentUserManageEmployees()) {
     alert('Akses Ditolak: Anda tidak memiliki hak akses mengelola pegawai.');
@@ -2733,6 +2852,12 @@ function handleSaveEmployee(event) {
       id: 'EMP-' + Date.now().toString().slice(-4),
       ...payload
     };
+    if (typeof isSupabaseEnabled === 'function' && isSupabaseEnabled() && typeof provisionSupabaseAuthUser === 'function') {
+      const authRes = await provisionSupabaseAuthUser(newEmp.nip, newEmp.pin, newEmp.name);
+      if (authRes.userId) {
+        newEmp.authUserId = authRes.userId;
+      }
+    }
     employees.push(newEmp);
     savedEmp = newEmp;
     showToast(`Pegawai ${newEmp.name} berhasil ditambahkan`);

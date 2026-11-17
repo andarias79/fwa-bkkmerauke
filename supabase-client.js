@@ -5,6 +5,9 @@
 
 const SUPABASE_CONFIG_STORAGE_KEY = 'efwa_supabase_config_v1';
 const SUPABASE_PHOTO_BUCKET = 'fwa-photos';
+const SUPABASE_AUTH_EMAIL_DOMAIN = 'efwa-merauke.app';
+const SIGNED_URL_TTL_SECONDS = 3600;
+const signedPhotoUrlCache = new Map();
 
 // Konfigurasi default proyek Supabase e-FWA BKK Kelas II Merauke
 window.EFWA_SUPABASE_DEFAULT_CONFIG = {
@@ -72,17 +75,21 @@ function updateSupabaseStatusBadge(connected) {
 }
 
 function mapEmployeeToDb(emp) {
-  return {
+  const row = {
     id: emp.id,
     name: emp.name,
     nip: emp.nip,
     position: emp.position || '',
     unit: emp.unit || '',
     role: emp.role || 'Pegawai',
-    pin: emp.pin || '123456',
+    pin: '',
     is_permanent: Boolean(emp.isPermanent),
     updated_at: new Date().toISOString()
   };
+  if (emp.authUserId) {
+    row.auth_user_id = emp.authUserId;
+  }
+  return row;
 }
 
 function mapEmployeeFromDb(row) {
@@ -93,9 +100,40 @@ function mapEmployeeFromDb(row) {
     position: row.position || '',
     unit: row.unit || '',
     role: row.role || 'Pegawai',
-    pin: row.pin || '',
+    pin: '',
+    authUserId: row.auth_user_id || '',
     isPermanent: Boolean(row.is_permanent)
   };
+}
+
+function extractStoragePath(val) {
+  if (!val || typeof val !== 'string') return '';
+  if (val.startsWith('data:image')) return '';
+  const marker = `/${SUPABASE_PHOTO_BUCKET}/`;
+  const idx = val.indexOf(marker);
+  if (idx !== -1) {
+    return val.slice(idx + marker.length).split('?')[0];
+  }
+  if (val.startsWith('http://') || val.startsWith('https://')) {
+    return '';
+  }
+  return val.split('?')[0];
+}
+
+function getPhotoDisplayUrl(storedVal) {
+  if (!storedVal || typeof storedVal !== 'string') return '';
+  if (storedVal.startsWith('data:image')) return storedVal;
+  const path = extractStoragePath(storedVal);
+  if (path && signedPhotoUrlCache.has(path)) {
+    const entry = signedPhotoUrlCache.get(path);
+    if (entry && entry.expiresAt > Date.now()) {
+      return entry.url;
+    }
+  }
+  if (storedVal.startsWith('http://') || storedVal.startsWith('https://')) {
+    return storedVal;
+  }
+  return '';
 }
 
 function mapRecordToDb(rec) {
@@ -111,8 +149,8 @@ function mapRecordToDb(rec) {
     response_time: rec.responseTime || '< 15 Menit (Sangat Cepat / On-Call)',
     activity_summary: rec.activitySummary || '',
     report_link: rec.reportLink || '',
-    photo_check_in_url: rec.photoCheckIn || '',
-    photo_check_out_url: rec.photoCheckOut || '',
+    photo_check_in_url: extractStoragePath(rec.photoCheckIn),
+    photo_check_out_url: extractStoragePath(rec.photoCheckOut),
     gps_check_in: rec.gpsCheckIn || '',
     gps_check_out: rec.gpsCheckOut || '',
     assignment_status: rec.assignmentStatus || 'Diajukan',
@@ -145,18 +183,145 @@ function mapRecordFromDb(row) {
   };
 }
 
+function nipToAuthEmail(nip) {
+  return `${String(nip || '').trim()}@${SUPABASE_AUTH_EMAIL_DOMAIN}`;
+}
+
+async function getSupabaseAuthSession() {
+  if (!isSupabaseEnabled()) return null;
+  try {
+    const { data, error } = await supabaseClient.auth.getSession();
+    if (error) throw error;
+    return data ? data.session : null;
+  } catch (err) {
+    console.warn('Gagal memeriksa sesi Supabase Auth:', err);
+    return null;
+  }
+}
+
+async function signInWithSupabaseAuth(nip, pin) {
+  if (!isSupabaseEnabled()) return { success: false, offline: true, error: 'Supabase tidak aktif' };
+  try {
+    const { data, error } = await supabaseClient.auth.signInWithPassword({
+      email: nipToAuthEmail(nip),
+      password: String(pin || '').trim()
+    });
+    if (error) return { success: false, offline: false, error: error.message };
+    return { success: true, session: data.session, user: data.user };
+  } catch (err) {
+    return { success: false, offline: false, error: err.message || 'Gagal autentikasi' };
+  }
+}
+
+async function signOutSupabaseAuth() {
+  if (!isSupabaseEnabled()) return;
+  try {
+    await supabaseClient.auth.signOut();
+  } catch (err) {
+    console.warn('Supabase signOut error:', err);
+  }
+}
+
+async function updateSupabaseAuthPassword(newPin) {
+  if (!isSupabaseEnabled()) return { success: false, error: 'Supabase tidak aktif' };
+  try {
+    const { error } = await supabaseClient.auth.updateUser({
+      password: String(newPin || '').trim()
+    });
+    if (error) return { success: false, error: error.message };
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message || 'Gagal memperbarui PIN Auth' };
+  }
+}
+
+async function provisionSupabaseAuthUser(nip, pin, name) {
+  if (!isSupabaseEnabled()) return { success: false, userId: '' };
+  const cfg = getSavedSupabaseConfig();
+  if (!cfg.url || !cfg.anonKey || !window.supabase) return { success: false, userId: '' };
+  try {
+    const tempClient = window.supabase.createClient(cfg.url, cfg.anonKey, {
+      auth: { persistSession: false, autoRefreshToken: false }
+    });
+    const { data, error } = await tempClient.auth.signUp({
+      email: nipToAuthEmail(nip),
+      password: String(pin || '123456').trim(),
+      options: { data: { name: name || '', nip: String(nip || '').trim() } }
+    });
+    if (error) throw error;
+    return { success: true, userId: data?.user?.id || '' };
+  } catch (err) {
+    console.warn('Gagal membuat akun Supabase Auth pegawai baru:', err);
+    return { success: false, userId: '' };
+  }
+}
+
+async function fetchLoginDirectoryFromSupabase() {
+  if (!isSupabaseEnabled()) return null;
+  try {
+    const { data, error } = await supabaseClient.rpc('get_login_directory');
+    if (error) throw error;
+    return (data || []).map(mapEmployeeFromDb);
+  } catch (err) {
+    console.warn('Gagal memuat direktori login Supabase:', err);
+    return null;
+  }
+}
+
+async function resolveSignedUrlsForRecords(records) {
+  if (!isSupabaseEnabled() || !Array.isArray(records) || records.length === 0) return;
+  const now = Date.now();
+  const pathsSet = new Set();
+  records.forEach((rec) => {
+    [rec.photoCheckIn, rec.photoCheckOut].forEach((val) => {
+      const p = extractStoragePath(val);
+      if (p) {
+        const cached = signedPhotoUrlCache.get(p);
+        if (!cached || cached.expiresAt <= now + 60000) {
+          pathsSet.add(p);
+        }
+      }
+    });
+  });
+
+  const paths = Array.from(pathsSet);
+  if (paths.length === 0) return;
+
+  try {
+    const { data, error } = await supabaseClient.storage
+      .from(SUPABASE_PHOTO_BUCKET)
+      .createSignedUrls(paths, SIGNED_URL_TTL_SECONDS);
+    if (error) throw error;
+    const expiresAt = Date.now() + (SIGNED_URL_TTL_SECONDS - 120) * 1000;
+    (data || []).forEach((item) => {
+      if (item && item.path && item.signedUrl) {
+        signedPhotoUrlCache.set(item.path, { url: item.signedUrl, expiresAt });
+      }
+    });
+  } catch (err) {
+    console.warn('Gagal membuat Signed URL foto privat:', err);
+  }
+}
+
 async function fetchAllFromSupabase() {
   if (!isSupabaseEnabled()) return null;
   try {
+    const session = await getSupabaseAuthSession();
+    if (!session) return null;
+
     const [empRes, recRes] = await Promise.all([
-      supabaseClient.from('employees').select('*').order('id', { ascending: true }),
+      supabaseClient.from('employees').select('id, name, nip, position, unit, role, is_permanent, auth_user_id').order('id', { ascending: true }),
       supabaseClient.from('fwa_records').select('*').order('date', { ascending: false })
     ]);
     if (empRes.error) throw empRes.error;
     if (recRes.error) throw recRes.error;
+
+    const mappedRecords = (recRes.data || []).map(mapRecordFromDb);
+    await resolveSignedUrlsForRecords(mappedRecords);
+
     return {
       employees: (empRes.data || []).map(mapEmployeeFromDb),
-      records: (recRes.data || []).map(mapRecordFromDb)
+      records: mappedRecords
     };
   } catch (err) {
     console.error('Supabase fetchAll error:', err);
@@ -235,9 +400,24 @@ async function upsertFwaRecordsBulkToSupabase(recList) {
   }
 }
 
+async function deletePhotosFromSupabase(recId) {
+  if (!isSupabaseEnabled() || !recId) return false;
+  try {
+    const { error } = await supabaseClient.storage
+      .from(SUPABASE_PHOTO_BUCKET)
+      .remove([`${recId}/in.jpg`, `${recId}/out.jpg`]);
+    if (error) throw error;
+    return true;
+  } catch (err) {
+    console.warn('Gagal menghapus file foto dari Supabase Storage:', err);
+    return false;
+  }
+}
+
 async function deleteFwaRecordFromSupabase(recId) {
   if (!isSupabaseEnabled()) return false;
   try {
+    await deletePhotosFromSupabase(recId);
     const { error } = await supabaseClient.from('fwa_records').delete().eq('id', recId);
     if (error) throw error;
     return true;
@@ -266,7 +446,7 @@ async function uploadPhotoToSupabase(recordId, mode, dataUrl) {
   try {
     const blob = dataUrlToBlob(dataUrl);
     const safeMode = mode === 'OUT' ? 'out' : 'in';
-    const filePath = `${recordId}/${safeMode}_${Date.now()}.jpg`;
+    const filePath = `${recordId}/${safeMode}.jpg`;
     const { error: uploadError } = await supabaseClient.storage
       .from(SUPABASE_PHOTO_BUCKET)
       .upload(filePath, blob, {
@@ -274,10 +454,17 @@ async function uploadPhotoToSupabase(recordId, mode, dataUrl) {
         upsert: true
       });
     if (uploadError) throw uploadError;
-    const { data: pubData } = supabaseClient.storage
+
+    const { data: signedData, error: signError } = await supabaseClient.storage
       .from(SUPABASE_PHOTO_BUCKET)
-      .getPublicUrl(filePath);
-    return (pubData && pubData.publicUrl) ? pubData.publicUrl : dataUrl;
+      .createSignedUrl(filePath, SIGNED_URL_TTL_SECONDS);
+    if (!signError && signedData && signedData.signedUrl) {
+      signedPhotoUrlCache.set(filePath, {
+        url: signedData.signedUrl,
+        expiresAt: Date.now() + (SIGNED_URL_TTL_SECONDS - 120) * 1000
+      });
+    }
+    return filePath;
   } catch (err) {
     console.warn('Gagal unggah foto ke Supabase Storage, menggunakan data lokal:', err);
     return dataUrl;
