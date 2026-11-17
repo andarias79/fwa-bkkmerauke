@@ -3243,6 +3243,12 @@ function sanitizeUrl(url) {
 // SUPABASE CONFIG MODAL HANDLERS
 // ============================================================================
 function openSupabaseConfigModal() {
+  if (!currentUserId || !canCurrentUserManageEmployees()) {
+    if (typeof showToast === 'function') {
+      showToast('Koneksi Cloud Supabase dikelola oleh Admin / Atasan.');
+    }
+    return;
+  }
   const cfg = typeof getSavedSupabaseConfig === 'function' ? getSavedSupabaseConfig() : { url: '', anonKey: '' };
   const urlEl = document.getElementById('supabaseUrlInput');
   const keyEl = document.getElementById('supabaseAnonKeyInput');
